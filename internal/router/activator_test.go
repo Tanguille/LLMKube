@@ -713,6 +713,9 @@ func TestActivatorAbandonsSwapAtDeadline(t *testing.T) {
 		t.Fatalf("Acquire err = %v after %s; the swap was never bounded, the caller just ran out of hold budget",
 			err, time.Since(start))
 	}
+	if !errors.Is(err, ErrSwapAbandoned) {
+		t.Fatalf("Acquire err = %v, want ErrSwapAbandoned so the proxy answers 503 + Retry-After", err)
+	}
 
 	a.mu.Lock()
 	pr := a.pools["lab/heavy-slot"]

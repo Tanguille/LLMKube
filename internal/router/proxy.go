@@ -286,10 +286,12 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		elapsed := time.Since(start)
 		if err != nil {
 			// ModelPool cold-start hold exceeded its budget: the client's request
-			// outlived the swap window. 503 + Retry-After is the standards-correct
+			// outlived the swap window. The hold and the swap deadline share
+			// pool.SwapBudget, so whichever timer fires first decides between
+			// ErrHoldBudgetExceeded and ErrSwapAbandoned; both are this outcome. 503 + Retry-After is the standards-correct
 			// "temporarily unavailable" signal so well-behaved clients back off
 			// deterministically; 429 would wrongly imply rate limiting.
-			if errors.Is(err, ErrHoldBudgetExceeded) {
+			if errors.Is(err, ErrHoldBudgetExceeded) || errors.Is(err, ErrSwapAbandoned) {
 				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
 				writeError(w, http.StatusServiceUnavailable,
 					"model pool activation did not complete within the request budget; retry")

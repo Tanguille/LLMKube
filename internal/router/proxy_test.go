@@ -675,11 +675,10 @@ func TestProxy503WhenNoRoute(t *testing.T) {
 func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	fb := newFakeBackend(t)
 
-	// The target never becomes Ready, so its swap is still loading when the
-	// caller's hold budget (pool.SwapBudget) expires and ends the request with
-	// 503 + Retry-After. A swap that ends first would surface as a 502: the
-	// hold and the swap deadline are both derived from the same budget, so the
-	// fixture keeps the swap loading rather than racing the two timers.
+	// The target never becomes Ready. The caller's hold and the swap deadline
+	// both derive from pool.SwapBudget, so either may fire first; both orderings
+	// must end the request with 503 + Retry-After.
+	// TestProxyPoolSwapAbandoned503RetryAfter pins the swap-first ordering.
 	fake := newFakeMemberController()
 	fake.noAutoReady = true
 
@@ -728,6 +727,68 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	}
 	if fb.calls.Load() != 0 {
 		t.Errorf("backend calls = %d, want 0 (must not dispatch when activation never completed)", fb.calls.Load())
+	}
+}
+
+// TestProxyPoolSwapAbandoned503RetryAfter pins the ordering where the swap
+// deadline fires before the caller's hold: the abandoned swap must surface as
+// the same retryable 503 + Retry-After as a hold timeout, not a 502. The two
+// timers share pool.SwapBudget in production and race; here the activator's
+// base context carries a short deadline (the swap context inherits it) while
+// the hold is long, so the swap is always abandoned first.
+func TestProxyPoolSwapAbandoned503RetryAfter(t *testing.T) {
+	fb := newFakeBackend(t)
+	fake := newFakeMemberController()
+	fake.noAutoReady = true
+
+	cfg := &Config{
+		Backends: []Backend{{
+			Name:    "coder",
+			Tier:    "local",
+			Address: fb.URL(),
+			Pool: &BackendPool{
+				Name:       "heavy-slot",
+				Namespace:  "lab",
+				Member:     "coder",
+				Members:    []string{"coder", "judge"},
+				SwapBudget: 10 * time.Second,
+			},
+		}},
+		DefaultRoute: "coder",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	baseCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	act := NewActivator(baseCtx, fake, "r", slog.Default())
+	proxy := NewProxy(cfg, slog.Default(), WithActivator(act))
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"coder","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	mux.ServeHTTP(rec, req)
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("request took %s; the hold ran out instead of the swap being abandoned", elapsed)
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body %q)", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header on abandoned-swap 503")
+	}
+	if fake.deactivateCount("coder") < 1 {
+		t.Error("abandoned target was not scaled back down")
+	}
+	if fb.calls.Load() != 0 {
+		t.Errorf("backend calls = %d, want 0", fb.calls.Load())
 	}
 }
 
