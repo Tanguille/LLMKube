@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -26,11 +25,14 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -68,6 +70,28 @@ func TestAgentGatewayModelProvider(t *testing.T) {
 			if ok != tt.wantOK || provider != tt.wantProvider || !reflect.DeepEqual(formats, tt.wantFormats) {
 				t.Errorf("agentGatewayModelProvider = (%q, %v, %v), want (%q, %v, %v)",
 					provider, formats, ok, tt.wantProvider, tt.wantFormats, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestVLLMServesModel(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"no flag", nil, false},
+		{"inline", []string{"--served-model-name=chat"}, true},
+		{"inline, other name", []string{"--served-model-name=other"}, false},
+		{"one of several names", []string{"--served-model-name", "other", "chat", "--port", "8000"}, true},
+		{"name after the next flag", []string{"--served-model-name", "other", "--port", "chat"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{Spec: inferencev1alpha1.InferenceServiceSpec{ExtraArgs: tt.args}}
+			if got := vllmServesModel(isvc, "chat"); got != tt.want {
+				t.Errorf("vllmServesModel(%v) = %v, want %v", tt.args, got, tt.want)
 			}
 		})
 	}
@@ -298,15 +322,16 @@ func TestModelRouterAgentGateway_InferencePoolStaysDefault(t *testing.T) {
 	}
 }
 
-func makeModelISvc(t *testing.T, c client.Client, ns, name, runtime, mode string, port int32) {
+func makeModelISvc(t *testing.T, c client.Client, ns, name, rt, mode string, port int32, extraArgs ...string) {
 	t.Helper()
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: inferencev1alpha1.InferenceServiceSpec{
-			ModelRef: name,
-			Runtime:  runtime,
-			Mode:     mode,
-			Endpoint: &inferencev1alpha1.EndpointSpec{Port: port},
+			ModelRef:  name,
+			Runtime:   rt,
+			Mode:      mode,
+			Endpoint:  &inferencev1alpha1.EndpointSpec{Port: port},
+			ExtraArgs: extraArgs,
 		},
 	}
 	if err := c.Create(context.Background(), isvc); err != nil {
@@ -346,7 +371,7 @@ func TestModelRouterAgentGateway_ModelRoutingCompiles(t *testing.T) {
 	ns := newTestNamespace(t, c)
 
 	makeGateway(t, c, ns, "ai-gateway", nil, nil)
-	makeModelISvc(t, c, ns, "chat-vllm", RuntimeVLLM, "", 8000)
+	makeModelISvc(t, c, ns, "chat-vllm", RuntimeVLLM, "", 8000, "--served-model-name=chat-large")
 	makeBackendISvcInNamespace(t, c, ns, "chat-llama")
 	makeModelISvc(t, c, ns, "reranker", "llamacpp", "rerank", 8080)
 	makeModelISvc(t, c, ns, "embedder", "", "embedding", 8080)
@@ -435,7 +460,7 @@ func TestModelRouterAgentGateway_ModelRoutingServedNames(t *testing.T) {
 
 	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 	makeBackendISvcInNamespace(t, c, ns, "chat-llama")
-	makeModelISvc(t, c, ns, "org-model", RuntimeVLLM, "", 8000)
+	makeModelISvc(t, c, ns, "org-model", RuntimeVLLM, "", 8000, "--served-model-name", "org/model")
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	for _, name := range []string{"team-a", "team-b"} {
@@ -647,6 +672,7 @@ func TestModelRouterAgentGateway_ModelRoutingRefusals(t *testing.T) {
 	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 	makeBackendISvcInNamespace(t, c, ns, "llama")
 	makeModelISvc(t, c, ns, "sglang", RuntimeSGLANG, "", 8080)
+	makeModelISvc(t, c, ns, "bare-vllm", RuntimeVLLM, "", 8000)
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 
 	tests := []struct {
@@ -657,6 +683,8 @@ func TestModelRouterAgentGateway_ModelRoutingRefusals(t *testing.T) {
 			func(mr *inferencev1alpha1.ModelRouter) { mr.Spec.DefaultRoute = "llama" }},
 		{"unmapped-runtime", "sglang", modelRouterAgentGatewayReasonUnsupportedRuntime, `runtime "sglang"`,
 			func(*inferencev1alpha1.ModelRouter) {}},
+		{"vllm-without-served-name", "bare-vllm", modelRouterAgentGatewayReasonUnsupportedRuntime,
+			`"--served-model-name=bare-vllm"`, func(*inferencev1alpha1.ModelRouter) {}},
 		{"unknown-listener", "llama", modelRouterAgentGatewayReasonNotAllowed, `no listener named "models"`,
 			func(mr *inferencev1alpha1.ModelRouter) { mr.Spec.AgentGatewayRef.SectionName = "models" }},
 	}
@@ -680,39 +708,59 @@ func TestModelRouterAgentGateway_ModelRoutingRefusals(t *testing.T) {
 
 // routing: Model needs the AgentgatewayModel CRD and nothing else.
 func TestModelRouterAgentGateway_ModelRoutingCRDGate(t *testing.T) {
-	reconcileGate := func(t *testing.T, extraCRDs ...string) (client.Client, *metav1.Condition) {
-		t.Helper()
-		crds := append([]string{
-			filepath.Join(inferenceExtensionTestCRDDir, "gateway.yaml"),
-			filepath.Join(inferenceExtensionTestCRDDir, "httproute.yaml"),
-		}, extraCRDs...)
-		c, cfg, stop := startAgentGatewayTestEnvWithCRDs(t, crds...)
-		t.Cleanup(stop)
+	t.Run("without the AgentgatewayModel CRD", func(t *testing.T) {
+		// The gate runs before the Gateway lookup, so the base-only env needs
+		// no Gateway.
+		c, cfg, stop := startAgentGatewayTestEnv(t, false)
+		defer stop()
+		ns := newTestNamespace(t, c)
+		makeBackendISvcInNamespace(t, c, ns, "gate-llama")
+		mr := modelRoutingRouter(ns, "gate", "gate-llama")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		reconcileAgentGatewayRouter(t, newModelRouterAgentGatewayReconciler(t, cfg), mr)
+		cond, _ := agentGatewayReadyCondition(t, c, mr)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonModelCRDMissing ||
+			!strings.Contains(cond.Message, "AgentgatewayModel (agentgateway.dev/v1alpha1)") {
+			t.Errorf("expected AgentGatewayReady=False/%s naming the kind, got %+v", modelRouterAgentGatewayReasonModelCRDMissing, cond)
+		}
+	})
+
+	t.Run("with only the AgentgatewayModel CRD", func(t *testing.T) {
+		// A RESTMapper that knows only this package's types, the Gateway API
+		// kinds the reconcile touches, and AgentgatewayModel: no InferencePool
+		// or AgentgatewayPolicy.
+		s := runtime.NewScheme()
+		if err := clientgoscheme.AddToScheme(s); err != nil {
+			t.Fatalf("scheme: %v", err)
+		}
+		if err := inferencev1alpha1.AddToScheme(s); err != nil {
+			t.Fatalf("scheme: %v", err)
+		}
+		mapper := apimeta.NewDefaultRESTMapper(nil)
+		for gvk := range s.AllKnownTypes() {
+			mapper.Add(gvk, apimeta.RESTScopeNamespace)
+		}
+		for _, gvk := range []schema.GroupVersionKind{
+			{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}, gatewayHTTPRouteGVK(), agentGatewayModelGVK(),
+		} {
+			mapper.Add(gvk, apimeta.RESTScopeNamespace)
+		}
+		c := fake.NewClientBuilder().WithScheme(s).WithRESTMapper(mapper).
+			WithStatusSubresource(&inferencev1alpha1.ModelRouter{}, &inferencev1alpha1.InferenceService{}).Build()
+
 		makeGateway(t, c, testNS, "ai-gateway", nil, nil)
 		makeBackendISvcInNamespace(t, c, testNS, "gate-llama")
 		mr := modelRoutingRouter(testNS, "gate", "gate-llama")
 		if err := c.Create(context.Background(), mr); err != nil {
 			t.Fatalf("create modelrouter: %v", err)
 		}
-		reconcileAgentGatewayRouter(t, newModelRouterAgentGatewayReconciler(t, cfg), mr)
-		cond, _ := agentGatewayReadyCondition(t, c, mr)
-		return c, cond
-	}
-
-	t.Run("without the AgentgatewayModel CRD", func(t *testing.T) {
-		c, cond := reconcileGate(t)
-		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonModelCRDMissing ||
-			!strings.Contains(cond.Message, "AgentgatewayModel (agentgateway.dev/v1alpha1)") {
-			t.Errorf("expected AgentGatewayReady=False/%s naming the kind, got %+v", modelRouterAgentGatewayReasonModelCRDMissing, cond)
-		}
-		assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), testNS, "gate")
-	})
-
-	t.Run("with only the AgentgatewayModel CRD", func(t *testing.T) {
-		c, cond := reconcileGate(t, filepath.Join(inferenceExtensionTestCRDDir, "agentgatewaymodel.yaml"))
-		if cond == nil || cond.Status != metav1.ConditionTrue {
+		reconcileAgentGatewayRouter(t, &ModelRouterAgentGatewayReconciler{Client: c, Scheme: s}, mr)
+		if cond, _ := agentGatewayReadyCondition(t, c, mr); cond == nil || cond.Status != metav1.ConditionTrue {
 			t.Errorf("expected AgentGatewayReady=True, got %+v", cond)
 		}
 		getUnstructuredInNamespace(t, c, agentGatewayModelGVK(), testNS, "gate-gate-llama")
+		getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), testNS, "gate")
 	})
 }

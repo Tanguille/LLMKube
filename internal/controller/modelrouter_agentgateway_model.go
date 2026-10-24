@@ -240,6 +240,31 @@ func newAgentGatewayModel(mr *inferencev1alpha1.ModelRouter, route string, b age
 	return u
 }
 
+// vllmServesModel reports whether vLLM answers to model. The request keeps its
+// model name, and LLMKube starts vLLM without --served-model-name (#1988), so
+// the name must come from the user's args.
+func vllmServesModel(isvc *inferencev1alpha1.InferenceService, model string) bool {
+	args := append(append([]string{}, isvc.Spec.ExtraArgs...), isvc.Spec.Args...)
+	for i, a := range args {
+		if v, ok := strings.CutPrefix(a, "--served-model-name="); ok && v == model {
+			return true
+		}
+		if a != "--served-model-name" {
+			continue
+		}
+		// vLLM takes one or more names after the flag.
+		for _, v := range args[i+1:] {
+			if strings.HasPrefix(v, "-") {
+				break
+			}
+			if v == model {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // resolveAgentGatewayModelBackends returns an agentGatewayRefusalError for an
 // unmapped runtime.
 func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayModelBackends(
@@ -261,9 +286,17 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayModelBackends(
 					"InferencePool for it", b.Name, isvc.Name, runtimeNameLabel(isvc)),
 			}
 		}
+		served := agentGatewayServedName(b)
+		if runtimeNameLabel(isvc) == RuntimeVLLM && !vllmServesModel(isvc, served) {
+			return nil, &agentGatewayRefusalError{
+				reason: modelRouterAgentGatewayReasonUnsupportedRuntime,
+				message: fmt.Sprintf("backend %q: vLLM InferenceService %q does not serve model %q, so every request "+
+					"would get a 404; add \"--served-model-name=%s\" to its extraArgs", b.Name, isvc.Name, served, served),
+			}
+		}
 		resolved = append(resolved, agentGatewayModelBackend{
 			ObjectName: agentGatewayModelName(mr, b.Name),
-			ServedName: agentGatewayServedName(b),
+			ServedName: served,
 			Service:    sanitizeDNSName(isvc.Name),
 			Port:       gatewayServicePort(isvc),
 			Provider:   provider,
