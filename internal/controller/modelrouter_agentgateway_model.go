@@ -242,9 +242,13 @@ func newAgentGatewayModel(mr *inferencev1alpha1.ModelRouter, route string, b age
 
 // vllmServesModel reports whether vLLM answers to model. The request keeps its
 // model name, and LLMKube starts vLLM without --served-model-name (#1988), so
-// the name must come from the user's args.
+// the name must come from the user's args. vLLM sees spec.args only with a
+// command override (setCommandAndArgs), otherwise just spec.extraArgs.
 func vllmServesModel(isvc *inferencev1alpha1.InferenceService, model string) bool {
-	args := append(append([]string{}, isvc.Spec.ExtraArgs...), isvc.Spec.Args...)
+	args := isvc.Spec.ExtraArgs
+	if len(isvc.Spec.Command) > 0 {
+		args = append(append([]string{}, isvc.Spec.Args...), args...)
+	}
 	for i, a := range args {
 		if v, ok := strings.CutPrefix(a, "--served-model-name="); ok && v == model {
 			return true

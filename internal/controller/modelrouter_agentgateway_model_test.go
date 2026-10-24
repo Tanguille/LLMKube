@@ -95,6 +95,24 @@ func TestVLLMServesModel(t *testing.T) {
 			}
 		})
 	}
+
+	// spec.args reaches vLLM only with a command override (setCommandAndArgs).
+	flag := []string{"--served-model-name=chat"}
+	for _, tt := range []struct {
+		name    string
+		command []string
+		want    bool
+	}{
+		{"args without command", nil, false},
+		{"args with command", []string{"vllm", "serve"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{Spec: inferencev1alpha1.InferenceServiceSpec{Command: tt.command, Args: flag}}
+			if got := vllmServesModel(isvc, "chat"); got != tt.want {
+				t.Errorf("vllmServesModel(command %v, args %v) = %v, want %v", tt.command, flag, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestAgentGatewayModelName(t *testing.T) {
